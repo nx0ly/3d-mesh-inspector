@@ -75,7 +75,7 @@ pub async fn run() {
         .transform(Mat4::from_nonuniform_scale(1.0, 0.007, 0.007))
         .unwrap();
     let edges = Gm::new(
-        InstancedMesh::new(&context, &edge_transformations(&cpu_mesh), &cylinder),
+        InstancedMesh::new(&context, &edge_transformations(&cpu_mesh, 50.), &cylinder),
         wireframe_mat.clone(),
     );
 
@@ -125,6 +125,15 @@ pub async fn run() {
         let screen = frame_input.screen();
         screen.clear(ClearState::color_and_depth(0.8, 0.8, 0.8, 1.0, 1.0));
 
+        let edge_instances = edge_transformations_screen_space(
+            &cpu_mesh, &camera, &viewport, dpi, 5., // min pixel length cutoff
+        );
+
+        let edges = Gm::new(
+            InstancedMesh::new(&context, &edge_instances, &cylinder),
+            wireframe_mat.clone(),
+        );
+
         screen.render(
             &camera,
             example_model.into_iter().chain(&edges),
@@ -136,25 +145,116 @@ pub async fn run() {
     });
 }
 
-fn edge_transformations(cpu_mesh: &CpuMesh) -> Instances {
+fn edge_transformations(cpu_mesh: &CpuMesh, min_length: f32) -> Instances {
     let indices = cpu_mesh.indices.to_u32().unwrap();
     let positions = cpu_mesh.positions.to_f32();
     let mut transformations = Vec::new();
+
+    // helper closure to check edge length before pushing
+    // may or may not work idk
+    let mut push_edge = |a: usize, b: usize| {
+        let p1 = positions[a];
+        let p2 = positions[b];
+        if (p2 - p1).magnitude() >= min_length {
+            transformations.push(edge_transform(p1, p2));
+        }
+    };
+
     for f in 0..indices.len() / 3 {
         let i1 = indices[3 * f] as usize;
         let i2 = indices[3 * f + 1] as usize;
         let i3 = indices[3 * f + 2] as usize;
 
         if i1 < i2 {
-            transformations.push(edge_transform(positions[i1], positions[i2]));
+            push_edge(i1, i2);
         }
         if i2 < i3 {
-            transformations.push(edge_transform(positions[i2], positions[i3]));
+            push_edge(i2, i3);
         }
         if i3 < i1 {
-            transformations.push(edge_transform(positions[i3], positions[i1]));
+            push_edge(i3, i1);
         }
     }
+
+    Instances {
+        transformations,
+        ..Default::default()
+    }
+}
+
+fn edge_transformations_screen_space(
+    cpu_mesh: &CpuMesh,
+    camera: &Camera,
+    viewport: &Viewport,
+    dpi: f32,
+    min_pixels: f32,
+) -> Instances {
+    let indices = cpu_mesh.indices.to_u32().unwrap();
+    let positions = cpu_mesh.positions.to_f32();
+    let mut transformations = Vec::new();
+
+    let view_proj = camera.projection() * camera.view();
+
+    let mut push_edge = |a: usize, b: usize| {
+        let p1 = positions[a];
+        let p2 = positions[b];
+
+        // project to clip space
+        let clip1 = view_proj * p1.extend(1.0);
+        let clip2 = view_proj * p2.extend(1.0);
+
+        if clip1.w <= 0.0 || clip2.w <= 0.0 {
+            return; // behind camera
+        }
+
+        // perspective divide to NDC
+        let ndc1 = clip1.truncate() / clip1.w;
+        let ndc2 = clip2.truncate() / clip2.w;
+
+        // quick reject if both points are outside same side of clip space
+        if (ndc1.x < -1.0 && ndc2.x < -1.0)
+            || (ndc1.x > 1.0 && ndc2.x > 1.0)
+            || (ndc1.y < -1.0 && ndc2.y < -1.0)
+            || (ndc1.y > 1.0 && ndc2.y > 1.0)
+            || (ndc1.z < -1.0 && ndc2.z < -1.0)
+            || (ndc1.z > 1.0 && ndc2.z > 1.0)
+        {
+            return; // edge is completely outside frustum
+        }
+
+        // convert NDC to screen coords in pixels
+        let screen1 = vec2(
+            (ndc1.x * 0.5 + 0.5) * viewport.width as f32,
+            (ndc1.y * 0.5 + 0.5) * viewport.height as f32,
+        );
+        let screen2 = vec2(
+            (ndc2.x * 0.5 + 0.5) * viewport.width as f32,
+            (ndc2.y * 0.5 + 0.5) * viewport.height as f32,
+        );
+
+        // screen space length in pixels
+        // may or may not work
+        if (screen2 - screen1).magnitude() >= min_pixels {
+            transformations.push(edge_transform(p1, p2));
+        }
+    };
+
+    for f in 0..indices.len() / 3 {
+        let i1 = indices[3 * f] as usize;
+        let i2 = indices[3 * f + 1] as usize;
+        let i3 = indices[3 * f + 2] as usize;
+
+        if i1 < i2 {
+            push_edge(i1, i2);
+        }
+        if i2 < i3 {
+            push_edge(i2, i3);
+        }
+        if i3 < i1 {
+            push_edge(i3, i1);
+        }
+    }
+
     Instances {
         transformations,
         ..Default::default()
